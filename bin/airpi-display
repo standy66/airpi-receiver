@@ -177,7 +177,9 @@ class ArtFetcher:
             self.state.changed.set()
 
     def _lookup(self, key, artist, album):
-        term = f"{artist} {BRACKETED.sub('', album)}"
+        # Search with the first artist only: Spotify lists every artist on the track
+        # ("Massive Attack, Elizabeth Fraser"), Apple files the album under the main one.
+        term = f"{artist.split(',')[0]} {BRACKETED.sub('', album)}"
         for country in ART_STOREFRONTS:
             query = urllib.parse.urlencode({"term": term, "entity": "album", "limit": 25,
                                             "country": country})
