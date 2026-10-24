@@ -266,10 +266,10 @@ class Framebuffer:
 
     def clear(self):
         """Black screen, written in chunks so no full-size image is needed."""
-        chunk = bytes(self.stride * 64)
         with open(FB, "r+b") as fb:
-            for _ in range(0, self.height, 64):
-                fb.write(chunk)
+            for top in range(0, self.height, 64):
+                rows = min(64, self.height - top)    # the last block may be shorter
+                fb.write(bytes(self.stride * rows))
 
     def show(self, frame, at=(0, 0)):
         """Write a whole frame, or a smaller patch whose top-left corner goes at `at`."""
