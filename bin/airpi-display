@@ -26,7 +26,7 @@ import time
 import urllib.parse
 import urllib.request
 
-from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 PIPE = "/tmp/shairport-sync-metadata"
 FB = "/dev/fb0"
@@ -41,7 +41,8 @@ INACTIVE_TIMEOUT = 5 * 60  # seconds without audio before the screen blanks and 
 OVERLAY_REFRESH = 2.0      # seconds between debug overlay updates
 BACKGROUND_ZOOM = 1.2      # crop the blurred background past the cover's edges
 BACKGROUND_BLUR = 12       # blur radius at 1/10 size (12 = about 120 px on a 4K screen)
-DITHER_SIGMA = 1.5         # strength of the anti-banding noise, in 8-bit levels
+BACKGROUND_BRIGHTNESS = 0.35  # the blurred background is darkened to this fraction
+DITHER_SIGMA = 1.5         # strength of the anti-banding noise, in output (8-bit) levels
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_MONO = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
@@ -340,26 +341,30 @@ def device_label(user_agent):
 
 
 NOISE_TILE = 256
-_noise = None
+_noise = {}
 
 
-def dither(image):
-    """Add faint noise (about ±1 level) so dark, smooth gradients don't show bands.
+def darken_dithered(image, factor):
+    """Scale brightness by `factor` with dithering, so dark gradients don't show bands.
 
-    One small noise tile is made once and repeated: much faster than full-screen
-    noise, and a repeating pattern this faint is invisible.
+    Darkening to 35% maps 256 levels onto ~90, and rounding makes steps. Adding faint
+    noise *before* that rounding (scaled up by 1/factor so it is DITHER_SIGMA output
+    levels) makes each pixel round up or down in proportion to its true value, so the
+    gradient stays smooth on average. One small noise tile is made once and repeated:
+    much faster than full-screen noise, and a repeating pattern this faint is invisible.
     """
-    global _noise
-    if _noise is None:                       # independent noise per channel, centred on 128
-        _noise = Image.merge("RGB", [Image.effect_noise((NOISE_TILE, NOISE_TILE), DITHER_SIGMA)
-                                     for _ in range(3)])
+    sigma = DITHER_SIGMA / factor
+    if sigma not in _noise:                  # independent noise per channel, centred on 128
+        _noise[sigma] = Image.merge("RGB", [Image.effect_noise((NOISE_TILE, NOISE_TILE), sigma)
+                                            for _ in range(3)])
+    tile = _noise[sigma]
     width, height = image.size
     for y in range(0, height, NOISE_TILE):
         for x in range(0, width, NOISE_TILE):
             box = (x, y, min(x + NOISE_TILE, width), min(y + NOISE_TILE, height))
-            noise = _noise.crop((0, 0, box[2] - x, box[3] - y))
+            noise = tile.crop((0, 0, box[2] - x, box[3] - y))
             image.paste(ImageChops.add(image.crop(box), noise, 1.0, -128), box)
-    return image
+    return image.point([round(v * factor) for v in range(256)] * 3)
 
 
 def fit_text(font, text, max_width):
@@ -375,13 +380,14 @@ def compose(size, title, artist, album, cover, device, fonts):
     if cover and title:                      # no title = sender without track info
         art = Image.open(io.BytesIO(cover)).convert("RGB")
         # Background: the cover zoomed past its edges (some covers have white borders),
-        # blurred and darkened at 1/10 size, then scaled up smoothly and dithered.
+        # blurred at 1/10 size and scaled up smoothly, all at full brightness so the
+        # gradients keep all 256 levels; darkened only at the end, with dithering.
         side = int(max(width, height) * BACKGROUND_ZOOM)
         bg = art.resize((side // 10, side // 10)).crop(
             ((side - width) // 20, (side - height) // 20,
              (side + width) // 20, (side + height) // 20))
-        bg = ImageEnhance.Brightness(bg.filter(ImageFilter.GaussianBlur(BACKGROUND_BLUR))).enhance(0.35)
-        frame = dither(bg.resize((width, height), Image.BICUBIC))
+        bg = bg.filter(ImageFilter.GaussianBlur(BACKGROUND_BLUR)).resize((width, height), Image.BICUBIC)
+        frame = darken_dithered(bg, BACKGROUND_BRIGHTNESS)
         art_size = int(height * 0.64)
         x, y = (width - art_size) // 2, int(height * 0.08)
         shadow = Image.new("L", (art_size, art_size), 110)
