@@ -41,7 +41,7 @@ INACTIVE_TIMEOUT = 5 * 60  # seconds without audio before the screen blanks and 
 OVERLAY_REFRESH = 2.0      # seconds between debug overlay updates
 BACKGROUND_ZOOM = 1.2      # crop the blurred background past the cover's edges
 BACKGROUND_BLUR = 12       # blur radius at 1/10 size (12 = about 120 px on a 4K screen)
-DITHER_SIGMA = 1.0         # strength of the anti-banding noise, in 8-bit levels
+DITHER_SIGMA = 1.5         # strength of the anti-banding noise, in 8-bit levels
 FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_MONO = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"

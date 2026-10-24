@@ -8,6 +8,8 @@ User=pi
 SupplementaryGroups=video
 # Detach the text console from the screen so nothing draws over the cover
 ExecStartPre=+/bin/sh -c "echo 0 > /sys/class/vtconsole/vtcon1/bind"
+# Full-range RGB over HDMI: the default (limited 16-235 for TV modes) causes banding in dark gradients
+ExecStartPre=+/bin/sh -c 'C=$$(modetest -M vc4 -c | awk "/HDMI-A-1/ {print \$$1; exit}"); modetest -M vc4 -w "$$C:Broadcast RGB:1"'
 # TV's MAC address for Wake-on-LAN, for TVs that ignore HDMI-CEC in standby (empty = CEC only)
 Environment=AIRPI_TV_MAC=
 ExecStart=/usr/bin/python3 /usr/local/bin/airpi-display

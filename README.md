@@ -42,7 +42,7 @@ sudo reboot
 |---|---|---|
 | `config/shairport-sync.conf` | `/etc/shairport-sync.conf` | Classic AirPlay, bit-perfect output, metadata pipe |
 | `bin/airpi-display` | `/usr/local/bin/airpi-display` | Now-playing screen, CEC control, debug overlay (Python + Pillow) |
-| `systemd/airpi-display.service` | `/etc/systemd/system/` | Runs the screen at low priority; detaches the text console |
+| `systemd/airpi-display.service` | `/etc/systemd/system/` | Runs the screen at low priority; detaches the text console; sets full-range HDMI |
 | `systemd/airpi-cec.service` | `/etc/systemd/system/` | Registers the Pi on HDMI-CEC as playback device "AirPi" at boot |
 
 Boot settings changed by the installer:
@@ -76,7 +76,10 @@ To switch to AirPlay 2 instead, remove `service_type` from the config and build 
 ### Now-playing screen
 
 - Shairport writes metadata (track text, `PICT` cover art, device, stream format, play start/end) to a named pipe. `airpi-display` parses it in a thread and redraws only when something visible changes.
-- The cover is shown at 64% of the screen height over a blurred, darkened copy of itself. If the sender gives a title but no picture, the screen shows text only. If it sends no track info at all (the Mac in classic mode), the screen shows an "AirPi — Playing from Mac" card.
+- The cover is shown at 64% of the screen height over a blurred, darkened copy of itself. The copy is zoomed 20% so the cover's edges (e.g. white borders) stay off-screen. If the sender gives a title but no picture, the screen shows text only. If it sends no track info at all (the Mac in classic mode), the screen shows an "AirPi — Playing from Mac" card.
+- **No banding in dark gradients:** two causes, two fixes.
+  - **HDMI range:** for TV resolutions such as 4K, the Pi's HDMI output defaults to *limited-range* RGB (16–235). The Pi squeezes 256 levels into 220 and the TV stretches them back, so some neighbouring levels merge into visible steps. The service sets `Broadcast RGB = Full` with `modetest` at every start; with the TV's Black Level on Auto, it follows.
+  - **Dithering:** the background is also dithered with a repeated 256 px noise tile (σ = 1.5 levels), which is invisible as grain but breaks up any remaining steps.
 - **High-res art:** each new album is looked up on the iTunes Search API (`gb`, then `us` storefront). The result is used only if the artist and album match exactly, ignoring "(Deluxe Edition)"-style suffixes and punctuation, and it's downloaded at exactly the on-screen size. Otherwise the sender's 512 px JPEG is kept. Up to 30 albums are cached in memory, and nothing is written to disk.
 - **Framebuffer instead of SDL/KMSDRM:** SDL's drawing path on the Pi produced a plane in the `AR24` format, which showed only black on the TV. Writing raw 32-bit pixels to `/dev/fb0` works, needs only Pillow, and costs 0% CPU between redraws: the display hardware keeps scanning out the last frame by itself.
 - **Memory:** a 4K redraw briefly needs about 170 MB, so the program calls `malloc_trim` after every redraw. At rest it uses about 60–80 MB.

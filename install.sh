@@ -25,7 +25,7 @@ sudo apt-get install -y -q --no-install-recommends \
   libpopt-dev libconfig-dev libasound2-dev avahi-daemon libavahi-client-dev libssl-dev \
   libsoxr-dev libplist-dev libplist-utils libsodium-dev libavutil-dev libavcodec-dev \
   libavformat-dev libswresample-dev uuid-dev libgcrypt-dev xxd \
-  alsa-utils v4l-utils python3-pil fonts-dejavu-core
+  alsa-utils v4l-utils libdrm-tests python3-pil fonts-dejavu-core
 
 echo "== shairport-sync ($SHAIRPORT_REF)"
 mkdir -p ~/src
