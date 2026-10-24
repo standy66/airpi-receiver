@@ -118,6 +118,16 @@ diagnostics = { statistics = "yes"; };
 
 ## Known limitations
 
+- **Rare dropouts while another device saturates the Wi-Fi** (e.g. a large download on a laptop). Measured with Shairport's statistics (October 2026, Pi on 5 GHz at 270 Mbit/s):
+  ```
+  Av Sync Error (ms) | All Sync PPM | Av Sync Window (ms) | Missing | Resend Reqs
+    5.38                0.0            1.35                  0          2
+  -19.19              203.9           54.49                  0          3     ← the drop
+  ```
+  No audio data was lost (`Missing` 0; the one re-requested packet arrived in time). The small timing packets Shairport exchanges with the sender were delayed behind the download, so for a few seconds the measured sync error spread over 54 ms. That's past Shairport's default 50 ms `resync_threshold_in_seconds`, so it did a hard resync, which you hear as a drop. A larger latency buffer would **not** help, since nothing arrived late. Not yet applied, in order of preference:
+  1. **Ethernet to the Pi** removes Wi-Fi from half the path.
+  2. **`resync_threshold_in_seconds = 0.25`** in the `general` section: brief timing hiccups no longer trigger a hard jump, and real drift is still corrected gradually. For a single speaker, being briefly 20–50 ms off is inaudible.
+  3. **Router airtime fairness / smart QoS / device priority**, if the router has it. WMM priorities only help if AirPlay's timing packets are tagged and the router honours the tags.
 - **The Mac sends no track info or artwork in classic mode** (all fields blank), so it gets the "Playing from Mac" card. The iPhone sends everything.
 - **Stale covers when switching apps:** the iPhone sometimes re-sends the previous app's cover with the new app's first track. This is left as is; the next track corrects it.
 - **Device, Agent and Stream are sent only when a session starts.** If `airpi-display` restarts mid-session, those overlay lines show `-` until the next pause/play.
