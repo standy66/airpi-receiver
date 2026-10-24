@@ -17,7 +17,9 @@ import base64
 import ctypes
 import io
 import json
+import os
 import re
+import socket
 import subprocess
 import threading
 import time
@@ -30,6 +32,9 @@ PIPE = "/tmp/shairport-sync-metadata"
 FB = "/dev/fb0"
 FB_SYS = "/sys/class/graphics/fb0"
 CEC_DEV = "/dev/cec0"
+# Some TVs (e.g. LG C3) switch HDMI-CEC off in standby; set the TV's MAC to wake it over the network.
+TV_MAC = os.environ.get("AIRPI_TV_MAC", "")
+TV_WAKE_WAIT = 20          # seconds to wait for the TV to come up after Wake-on-LAN
 DAC_STATUS = "/proc/asound/QX11/pcm0p/sub0/status"
 DAC_PARAMS = "/proc/asound/QX11/pcm0p/sub0/hw_params"
 INACTIVE_TIMEOUT = 5 * 60  # seconds without audio before the screen blanks and the TV sleeps
@@ -234,17 +239,37 @@ def listen_cec(state):
         time.sleep(5)
 
 
+def wake_on_lan(mac):
+    packet = b"\xff" * 6 + bytes.fromhex(mac.replace(":", "").replace("-", "")) * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.sendto(packet, ("255.255.255.255", 9))
+
+
 def wake_tv(state):
     """Audio started: if the TV is asleep, turn it on and switch to AirPi."""
-    addr = my_physical_address()
+    addr = my_physical_address()             # asks the Pi's own adapter, nothing on the bus
+    state.update(my_addr=addr)
+    if not addr:
+        return
+    # Image View On must be the first message: some TVs stay asleep if anything comes before it.
+    # A TV that is already on just ignores it.
+    cec("--to", "0", "--image-view-on")
     power = tv_power_status()
-    state.update(my_addr=addr, tv_power=power)
-    if addr and power != "on":
-        cec("--to", "0", "--image-view-on")
-        time.sleep(2)
-        cec("--to", "15", "--active-source", f"phys-addr={addr}")
-        state.update(tv_power="on", tv_route=addr)
-        print("tv: turned on and switched to AirPi", flush=True)
+    print(f"tv: wake sent, TV reports {power}", flush=True)
+    if power == "on":                        # it was already on: leave its input alone
+        state.update(tv_power=power)
+        return
+    if power == "unknown" and TV_MAC:        # no CEC answer at all: deep standby
+        wake_on_lan(TV_MAC)
+        print("tv: Wake-on-LAN sent", flush=True)
+        deadline = time.monotonic() + TV_WAKE_WAIT
+        while time.monotonic() < deadline and tv_power_status() != "on":
+            time.sleep(1)
+    time.sleep(3)                            # give the TV a moment before switching input
+    cec("--to", "15", "--active-source", f"phys-addr={addr}")
+    state.update(tv_power="on", tv_route=addr)
+    print("tv: switched to AirPi", flush=True)
 
 
 def sleep_tv(state):

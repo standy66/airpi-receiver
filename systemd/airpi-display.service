@@ -8,6 +8,8 @@ User=pi
 SupplementaryGroups=video
 # Detach the text console from the screen so nothing draws over the cover
 ExecStartPre=+/bin/sh -c "echo 0 > /sys/class/vtconsole/vtcon1/bind"
+# TV's MAC address for Wake-on-LAN, for TVs that ignore HDMI-CEC in standby (empty = CEC only)
+Environment=AIRPI_TV_MAC=
 ExecStart=/usr/bin/python3 /usr/local/bin/airpi-display
 Restart=always
 RestartSec=3

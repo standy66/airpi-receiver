@@ -22,7 +22,7 @@ iPhone / Mac ──AirPlay (classic, ALAC 44.1/16)──► shairport-sync ─�
 
 - Raspberry Pi 4 Model B (1 GB is plenty: about 60–80 MB in use)
 - USB DAC on a **USB-A** port. The Pi's USB-C port is power only. Built and tested with a FiiO QX11.
-- TV on **HDMI0** (the port next to USB-C), with HDMI-CEC enabled. Tested with an LG C3, where CEC is called SIMPLINK.
+- TV on **HDMI0** (the port next to USB-C), with HDMI-CEC enabled. Tested with an LG C3, where CEC is called SIMPLINK and the TV needs "Turn on via Wi-Fi" for wake-up (see below).
 
 ## Install
 
@@ -30,7 +30,7 @@ On Raspberry Pi OS Lite (64-bit, Trixie):
 
 ```bash
 git clone https://github.com/standy66/airpi-receiver.git && cd airpi-receiver
-DAC_CARD=QX11 ./install.sh   # card name from `aplay -l`
+DAC_CARD=QX11 TV_MAC=aa:bb:cc:dd:ee:ff ./install.sh   # card name from `aplay -l`; TV_MAC optional
 sudo reboot
 ```
 
@@ -85,7 +85,12 @@ To switch to AirPlay 2 instead, remove `service_type` from the config and build 
 
 The program follows CEC traffic with `cec-ctl --wait-for-msgs`:
 
-- **Audio starts** (the DAC's ALSA status becomes `RUNNING`, so this also works for senders without metadata): if the TV is in standby, it sends *Image View On* and *Active Source*. If the TV is already on another input, it's left alone.
+- **Audio starts** (the DAC's ALSA status becomes `RUNNING`, so this also works for senders without metadata): it first sends *Image View On*, which has to be the first message because some TVs stay asleep if anything comes before it. Then it asks for the TV's power status:
+  - **The TV answers "on":** it was already on, so its input is left alone.
+  - **The TV doesn't answer:** it's in deep standby with CEC switched off. If `AIRPI_TV_MAC` is set, AirPi sends **Wake-on-LAN** and waits for the TV to come up.
+  - Then it sends *Active Source* to switch the TV to AirPi's input.
+
+  **LG C3:** in standby the TV doesn't acknowledge any CEC message, even with SIMPLINK and Quick Start+ on and on any HDMI port, so CEC alone can't wake it. Enable **All Settings → General → Devices → External Devices → TV On With Mobile → Turn on via Wi-Fi**, then set the TV's MAC (`TV_MAC=` for `install.sh`, or `AIRPI_TV_MAC` in `airpi-display.service`). From music starting to the TV showing AirPi takes about 6 seconds. CEC *Standby* does work on the C3, so the auto-off needs nothing extra.
 - **No audio for 5 minutes** (`INACTIVE_TIMEOUT`): the screen goes black, and the TV is sent *Standby* **only if** it's still on AirPi's input. That's known from routing messages, and from remote key presses, which the TV forwards only to the active input.
 - **Remote keys:** **OK** toggles the debug overlay and **Back** hides it.
 

@@ -8,11 +8,13 @@
 #   DAC_CARD        ALSA card name of the USB DAC, see `aplay -l`   (default: QX11)
 #   HDMI_MODE       HDMI output for the now-playing screen          (default: 3840x2160-32@30)
 #   SHAIRPORT_REF   shairport-sync commit/tag to build              (default: cf6998da, i.e. 5.6+7)
+#   TV_MAC          TV's MAC address, to wake TVs that ignore HDMI-CEC in standby (default: none)
 set -euo pipefail
 
 DAC_CARD=${DAC_CARD:-QX11}
 HDMI_MODE=${HDMI_MODE:-3840x2160-32@30}
 SHAIRPORT_REF=${SHAIRPORT_REF:-cf6998da}
+TV_MAC=${TV_MAC:-}
 REPO=$(cd "$(dirname "$0")" && pwd)
 export DEBIAN_FRONTEND=noninteractive
 
@@ -61,7 +63,8 @@ echo "== now-playing screen and HDMI-CEC"
 sed "s/QX11/$DAC_CARD/g" "$REPO/bin/airpi-display" | sudo tee /usr/local/bin/airpi-display >/dev/null
 sudo chmod 755 /usr/local/bin/airpi-display
 sudo install -m 644 "$REPO/systemd/airpi-display.service" "$REPO/systemd/airpi-cec.service" /etc/systemd/system/
-sudo sed -i "s/^User=pi$/User=$USER/" /etc/systemd/system/airpi-display.service
+sudo sed -i "s/^User=pi$/User=$USER/; s/^Environment=AIRPI_TV_MAC=.*/Environment=AIRPI_TV_MAC=$TV_MAC/" \
+  /etc/systemd/system/airpi-display.service
 
 sudo systemctl daemon-reload
 sudo systemctl enable shairport-sync airpi-cec airpi-display
