@@ -108,6 +108,8 @@ def handle_item(state, m):
     text = data.decode("utf-8", "replace").strip()
     if code in ("asal", "asar", "minm"):
         field = {"asal": "album", "asar": "artist", "minm": "title"}[code]
+        if field == "artist":                # Spotify appends labels like " • Video Available"
+            text = text.split(" • ")[0].strip()
         if state.get(field)[0] != text:
             if field == "title":
                 state.update(title=text)
