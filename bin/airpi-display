@@ -1,0 +1,489 @@
+#!/usr/bin/env python3
+"""AirPi now-playing screen.
+
+Reads Shairport Sync's metadata pipe and draws the current cover art, title and
+artist full-screen by writing straight to the Linux framebuffer (/dev/fb0), so
+no desktop, SDL or GPU libraries are needed.
+
+Over HDMI-CEC (via cec-ctl) it also:
+  * turns the TV on and selects AirPi's input when audio starts, if the TV was in standby;
+  * puts the TV in standby after INACTIVE_TIMEOUT without audio, if the TV is still on AirPi;
+  * reads the TV remote: OK toggles a debug overlay, Back hides it.
+
+Covers are upgraded to high resolution from Apple's public iTunes Search API
+when the artist and album match exactly; otherwise the sender's 512 px art is used.
+"""
+import base64
+import ctypes
+import io
+import json
+import re
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+
+PIPE = "/tmp/shairport-sync-metadata"
+FB = "/dev/fb0"
+FB_SYS = "/sys/class/graphics/fb0"
+CEC_DEV = "/dev/cec0"
+DAC_STATUS = "/proc/asound/QX11/pcm0p/sub0/status"
+DAC_PARAMS = "/proc/asound/QX11/pcm0p/sub0/hw_params"
+INACTIVE_TIMEOUT = 5 * 60  # seconds without audio before the screen blanks and the TV sleeps
+OVERLAY_REFRESH = 2.0      # seconds between debug overlay updates
+FONT_BOLD = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+FONT_MONO = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+ART_STOREFRONTS = ("gb", "us")  # iTunes storefronts to search, in order
+ART_CACHE_SIZE = 30             # albums kept in memory
+BRACKETED = re.compile(r"\s*[\(\[][^)\]]*[\)\]]")  # "(Deluxe Edition)", "[Remastered]"
+STALE_COVER = 2.0               # seconds: a cover older than its track's text belongs to the previous track
+
+ITEM = re.compile(
+    rb"<item><type>([0-9a-f]{8})</type><code>([0-9a-f]{8})</code><length>(\d+)</length>"
+    rb"(?:\s*<data encoding=\"base64\">\s*(.*?)</data>)?\s*</item>",
+    re.S,
+)
+
+
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.changed = threading.Event()
+        self.title = self.artist = self.album = ""
+        self.cover = None          # raw image bytes
+        self.cover_at = 0.0        # when the cover arrived
+        self.track_at = 0.0        # when the artist or album last changed
+        self.user_agent = self.client_ip = self.stream_format = ""
+        self.volume = None         # AirPlay volume, -30..0 (-144 = mute)
+        self.overlay = False
+        self.tv_power = "unknown"
+        self.tv_route = None       # physical address the TV is showing, if known
+        self.my_addr = None        # AirPi's physical address
+
+    def update(self, **kw):
+        with self.lock:
+            for key, value in kw.items():
+                setattr(self, key, value)
+        self.changed.set()
+
+    def get(self, *names):
+        with self.lock:
+            return tuple(getattr(self, n) for n in names)
+
+
+# --- Shairport metadata ------------------------------------------------------
+
+def read_metadata(state):
+    """Parse the pipe forever; Shairport reopens it on restart."""
+    while True:
+        try:
+            with open(PIPE, "rb") as pipe:
+                buf = b""
+                while chunk := pipe.read(65536):
+                    buf += chunk
+                    while m := ITEM.search(buf):
+                        handle_item(state, m)
+                        buf = buf[m.end():]
+        except OSError:
+            pass
+        time.sleep(1)
+
+
+def handle_item(state, m):
+    code = bytes.fromhex(m.group(2).decode()).decode("latin1")
+    data = base64.b64decode(m.group(4)) if m.group(4) else b""
+    text = data.decode("utf-8", "replace").strip()
+    if code in ("asal", "asar", "minm"):
+        field = {"asal": "album", "asar": "artist", "minm": "title"}[code]
+        if state.get(field)[0] != text:
+            if field == "title":
+                state.update(title=text)
+            else:
+                state.update(**{field: text}, track_at=time.monotonic())
+    elif code == "PICT" and data:            # empty pictures are ignored
+        state.update(cover=data, cover_at=time.monotonic())
+    elif code == "snua":
+        state.update(user_agent=text)
+    elif code == "clip":
+        # Not a reason to forget the track: a new device sends its own track info,
+        # and the same iPhone may reconnect from a different (IPv4/IPv6) address.
+        state.update(client_ip=text)
+    elif code == "sdsc":
+        state.update(stream_format=text)
+    elif code == "pvol":
+        try:
+            state.update(volume=float(text.split(",")[0]))
+        except ValueError:
+            pass
+
+
+# --- High-resolution artwork -------------------------------------------------
+
+def normalize(text):
+    """Lower-case, drop "(Deluxe Edition)"-style suffixes and punctuation for comparing names."""
+    text = BRACKETED.sub("", text.lower())
+    text = re.sub(r"\s+-\s+(single|ep)$", "", text)
+    return " ".join(re.sub(r"[^\w]+", " ", text).split())
+
+
+class ArtFetcher:
+    """Looks up album art on the iTunes Search API in the background, one album at a time."""
+
+    def __init__(self, state, size):
+        self.state, self.size = state, size
+        self.lock = threading.Lock()
+        self.cache = {}            # (artist, album) -> image bytes, or None while pending / not found
+
+    def get(self, artist, album):
+        if not (artist and album):
+            return None
+        key = (normalize(artist), normalize(album))
+        with self.lock:
+            if key in self.cache:
+                return self.cache[key]
+            self.cache[key] = None
+            while len(self.cache) > ART_CACHE_SIZE:
+                self.cache.pop(next(iter(self.cache)))
+        threading.Thread(target=self._fetch, args=(key, artist, album), daemon=True).start()
+        return None
+
+    def _fetch(self, key, artist, album):
+        try:
+            art = self._lookup(key, artist, album)
+        except (OSError, ValueError) as err:  # network trouble: allow a retry on the next track
+            print("art: lookup failed:", err, flush=True)
+            with self.lock:
+                self.cache.pop(key, None)
+            return
+        print("art:", "found" if art else "no match", "for", artist, "-", album, flush=True)
+        if art:
+            with self.lock:
+                self.cache[key] = art
+            self.state.changed.set()
+
+    def _lookup(self, key, artist, album):
+        term = f"{artist} {BRACKETED.sub('', album)}"
+        for country in ART_STOREFRONTS:
+            query = urllib.parse.urlencode({"term": term, "entity": "album", "limit": 25,
+                                            "country": country})
+            with urllib.request.urlopen(f"https://itunes.apple.com/search?{query}", timeout=8) as r:
+                results = json.load(r).get("results", [])
+            for item in results:
+                name, by = normalize(item.get("collectionName", "")), normalize(item.get("artistName", ""))
+                if name == key[1] and (key[0] in by or by in key[0]) and item.get("artworkUrl100"):
+                    url = item["artworkUrl100"].replace("100x100bb", f"{self.size}x{self.size}bb")
+                    with urllib.request.urlopen(url, timeout=8) as r:
+                        data = r.read()
+                    Image.open(io.BytesIO(data)).verify()  # make sure it is a real image
+                    return data
+        return None
+
+
+# --- HDMI-CEC ----------------------------------------------------------------
+
+def cec(*args):
+    try:
+        return subprocess.run(["cec-ctl", "-d", CEC_DEV, *args], capture_output=True,
+                              text=True, timeout=8).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def my_physical_address():
+    m = re.search(r"Physical Address\s*:\s*([0-9a-f.]+)", cec())
+    return m.group(1) if m and m.group(1) != "f.f.f.f" else None
+
+
+def tv_power_status():
+    m = re.search(r"pwr-state:\s*([a-z-]+)", cec("--to", "0", "--give-device-power-status"))
+    return m.group(1) if m else "unknown"
+
+
+def listen_cec(state):
+    """Follow CEC traffic: remote keys and which input the TV is showing."""
+    route_msgs = ("ROUTING_CHANGE", "ROUTING_INFORMATION", "ACTIVE_SOURCE", "SET_STREAM_PATH")
+    while True:
+        try:
+            proc = subprocess.Popen(["stdbuf", "-oL", "cec-ctl", "-d", CEC_DEV, "--wait-for-msgs"],
+                                    stdout=subprocess.PIPE, text=True)
+            msg = ""
+            for line in proc.stdout:
+                if line.startswith("Received from"):
+                    msg = line.split(": ", 1)[1].split(" (")[0] if ": " in line else ""
+                    if msg == "STANDBY":
+                        state.update(tv_power="standby", tv_route=None)
+                    if msg not in ("DEVICE_VENDOR_ID", "USER_CONTROL_RELEASED"):
+                        print("cec", line.strip(), flush=True)
+                elif msg == "USER_CONTROL_PRESSED" and "ui-cmd:" in line:
+                    key = line.split("ui-cmd:")[1].split("(")[0].strip()
+                    # The TV only forwards keys while it is showing our input.
+                    state.update(tv_route=state.get("my_addr")[0], tv_power="on")
+                    if key == "select":
+                        state.update(overlay=not state.get("overlay")[0])
+                    elif key == "back":
+                        state.update(overlay=False)
+                elif msg in route_msgs and re.search(r"(new-)?phys-addr:", line):
+                    if msg != "ROUTING_CHANGE" or "new-phys-addr" in line:
+                        state.update(tv_route=line.split(":", 1)[1].strip(), tv_power="on")
+        except OSError:
+            pass
+        time.sleep(5)
+
+
+def wake_tv(state):
+    """Audio started: if the TV is asleep, turn it on and switch to AirPi."""
+    addr = my_physical_address()
+    power = tv_power_status()
+    state.update(my_addr=addr, tv_power=power)
+    if addr and power != "on":
+        cec("--to", "0", "--image-view-on")
+        time.sleep(2)
+        cec("--to", "15", "--active-source", f"phys-addr={addr}")
+        state.update(tv_power="on", tv_route=addr)
+        print("tv: turned on and switched to AirPi", flush=True)
+
+
+def sleep_tv(state):
+    """Long inactivity: put the TV in standby only if it is still showing AirPi."""
+    my_addr, route = state.get("my_addr", "tv_route")
+    if my_addr and route == my_addr and tv_power_status() == "on":
+        cec("--to", "0", "--standby")
+        state.update(tv_power="standby", tv_route=None)
+        print("tv: standby after inactivity", flush=True)
+
+
+# --- Output ------------------------------------------------------------------
+
+class Framebuffer:
+    def __init__(self):
+        self.width, self.height = (int(v) for v in open(f"{FB_SYS}/virtual_size").read().split(","))
+        self.bpp = int(open(f"{FB_SYS}/bits_per_pixel").read())
+        self.stride = int(open(f"{FB_SYS}/stride").read())
+
+    def clear(self):
+        """Black screen, written in chunks so no full-size image is needed."""
+        chunk = bytes(self.stride * 64)
+        with open(FB, "r+b") as fb:
+            for _ in range(0, self.height, 64):
+                fb.write(chunk)
+
+    def show(self, frame, at=(0, 0)):
+        """Write a whole frame, or a smaller patch whose top-left corner goes at `at`."""
+        if self.bpp == 32:
+            data = frame.convert("RGBA").tobytes("raw", "BGRA")
+        else:
+            data = frame.tobytes("raw", "BGR;16")   # RGB565
+        pixel = self.bpp // 8
+        row = frame.width * pixel
+        with open(FB, "r+b") as fb:
+            if at == (0, 0) and row == self.stride:
+                fb.write(data)
+                return
+            for r in range(frame.height):           # row by row into the right place
+                fb.seek((at[1] + r) * self.stride + at[0] * pixel)
+                fb.write(data[r * row:(r + 1) * row])
+
+
+def dac_running():
+    try:
+        return open(DAC_STATUS).read().startswith("state: RUNNING")
+    except OSError:
+        return False
+
+
+def dac_format():
+    try:
+        p = dict(line.split(": ", 1) for line in open(DAC_PARAMS).read().splitlines() if ": " in line)
+        return f"{p['format']} · {p['rate'].split()[0]} Hz · {p['channels']} ch"
+    except (OSError, KeyError, ValueError):
+        return "idle"
+
+
+def device_label(user_agent):
+    if user_agent.startswith("AirPlay/"):
+        return "iPhone / iPad"
+    if "Macintosh" in user_agent:
+        return "Mac" + (" (Music app)" if user_agent.startswith("Music/") else "")
+    return user_agent.split(" ")[0] or "unknown"
+
+
+def fit_text(font, text, max_width):
+    if font.getlength(text) <= max_width:
+        return text
+    while text and font.getlength(text + "…") > max_width:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def compose(size, title, artist, album, cover, device, fonts):
+    width, height = size
+    if cover and title:                      # no title = sender without track info
+        art = Image.open(io.BytesIO(cover)).convert("RGB")
+        # Background: the cover stretched to fill, blurred small, darkened.
+        side = max(width, height)
+        bg = art.resize((side // 10, side // 10)).crop(
+            ((side - width) // 20, (side - height) // 20,
+             (side + width) // 20, (side + height) // 20))
+        bg = bg.filter(ImageFilter.GaussianBlur(4)).resize((width, height), Image.BILINEAR)
+        frame = ImageEnhance.Brightness(bg).enhance(0.35)
+        art_size = int(height * 0.64)
+        x, y = (width - art_size) // 2, int(height * 0.08)
+        shadow = Image.new("L", (art_size, art_size), 110)
+        frame.paste((0, 0, 0), (x + height * 10 // 1080, y + height * 14 // 1080), shadow)
+        frame.paste(art.resize((art_size, art_size), Image.LANCZOS), (x, y))
+        text_top = y + art_size + int(height * 0.045)
+    else:
+        frame = Image.new("RGB", size, (12, 12, 14))
+        text_top = int(height * 0.42)
+        if not title:                        # sender without track info (e.g. the Mac)
+            title, artist, album = "AirPi", f"Playing from {device}", ""
+
+    title_font, sub_font, _ = fonts
+    draw = ImageDraw.Draw(frame)
+    max_w = int(width * 0.86)
+    sub = " — ".join(part for part in (artist, album) if part)
+    draw.text((width // 2, text_top), fit_text(title_font, title, max_w),
+              font=title_font, fill=(245, 245, 245), anchor="mt")
+    draw.text((width // 2, text_top + int(height * 0.062)), fit_text(sub_font, sub, max_w),
+              font=sub_font, fill=(185, 185, 190), anchor="mt")
+    return frame
+
+
+def debug_lines(state, inactive_for, running):
+    ua, ip, fmt, vol, power, route, addr = state.get(
+        "user_agent", "client_ip", "stream_format", "volume", "tv_power", "tv_route", "my_addr")
+    try:
+        wifi = open("/proc/net/wireless").read().splitlines()[-1].split()[3].rstrip(".") + " dBm"
+    except (OSError, IndexError):
+        wifi = "?"
+    try:
+        temp = int(open("/sys/class/thermal/thermal_zone0/temp").read()) / 1000
+        mem = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable"))
+    except (OSError, StopIteration, ValueError):
+        temp, mem = 0, 0
+    vol_text = "mute" if vol is not None and vol <= -144 else (f"{vol:.1f} / 0" if vol is not None else "?")
+    idle = "playing" if running else f"idle {int(inactive_for)}s / {INACTIVE_TIMEOUT}s"
+    on_airpi = "AirPi" if route and route == addr else (route or "?")
+    return [
+        f"Device   {device_label(ua)}  {ip}",
+        f"Agent    {ua or '-'}",
+        f"Stream   {fmt or '-'}",
+        f"To DAC   {dac_format()}",
+        f"Volume   {vol_text}",
+        f"Status   {idle}",
+        f"TV       {power}, input {on_airpi}",
+        f"Pi       Wi-Fi {wifi} · {temp:.0f}°C · {mem // 1024} MB free",
+    ]
+
+
+def region(frame, box):
+    """A piece of the current frame; frame None means the screen is black."""
+    if frame is None:
+        return Image.new("RGB", (box[2] - box[0], box[3] - box[1]))
+    return frame.crop(box)
+
+
+libc = ctypes.CDLL("libc.so.6")
+
+
+def release_memory():
+    """Hand freed image memory back to the system (a 4K redraw briefly needs ~170 MB)."""
+    libc.malloc_trim(0)
+
+
+def overlay_patch(frame, lines, font, previous_box):
+    """Draw the debug panel over just its corner of `frame`.
+
+    Returns (patch, box). The patch also covers `previous_box`, so a panel that got
+    narrower than last time leaves no leftovers on screen.
+    """
+    pad, margin, line_h = font.size, int(font.size * 1.3), int(font.size * 1.45)
+    width = int(max(font.getlength(line) for line in lines)) + 2 * pad
+    height = line_h * len(lines) + 2 * pad
+    box = (margin, margin, margin + width, margin + height)
+    if previous_box:
+        box = (box[0], box[1], max(box[2], previous_box[2]), max(box[3], previous_box[3]))
+    panel = Image.new("RGBA", (box[2] - box[0], box[3] - box[1]), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(panel)
+    draw.rounded_rectangle((0, 0, width, height), radius=pad * 3 // 4, fill=(0, 0, 0, 185))
+    for i, line in enumerate(lines):
+        draw.text((pad, pad + i * line_h), line, font=font, fill=(220, 255, 220, 255))
+    patch = Image.alpha_composite(region(frame, box).convert("RGBA"), panel).convert("RGB")
+    return patch, (margin, margin, margin + width, margin + height)
+
+
+# --- Main loop ---------------------------------------------------------------
+
+def main():
+    fb = Framebuffer()
+    size = (fb.width, fb.height)
+    fonts = (ImageFont.truetype(FONT_BOLD, int(fb.height * 0.045)),
+             ImageFont.truetype(FONT_REGULAR, int(fb.height * 0.032)),
+             ImageFont.truetype(FONT_MONO, int(fb.height * 0.022)))
+
+    state = State()
+    state.update(my_addr=my_physical_address())
+    art_fetcher = ArtFetcher(state, int(fb.height * 0.64))  # exactly the on-screen cover size
+    threading.Thread(target=read_metadata, args=(state,), daemon=True).start()
+    threading.Thread(target=listen_cec, args=(state,), daemon=True).start()
+
+    was_running = False
+    last_audio = None          # monotonic time audio was last seen; None = not since boot
+    tv_slept = True
+    shown_key, base = object(), None   # base: the frame on screen without overlay; None = black
+    dirty, panel_box, overlay_at = True, None, 0.0  # panel_box: where the overlay is drawn now
+    while True:
+        state.changed.wait(timeout=1.0)
+        state.changed.clear()
+        now = time.monotonic()
+
+        running = dac_running()
+        if running:
+            last_audio = now
+            if not was_running:
+                tv_slept = False
+                threading.Thread(target=wake_tv, args=(state,), daemon=True).start()
+        was_running = running
+        inactive_for = 0 if last_audio is None or running else now - last_audio
+        active = last_audio is not None and inactive_for < INACTIVE_TIMEOUT
+
+        if last_audio is not None and not active and not tv_slept:
+            tv_slept = True
+            state.update(title="", artist="", album="", cover=None)
+            threading.Thread(target=sleep_tv, args=(state,), daemon=True).start()
+
+        def view_key():
+            title, artist, album, cover, cover_at, track_at, ua = state.get(
+                "title", "artist", "album", "cover", "cover_at", "track_at", "user_agent")
+            if cover_at < track_at - STALE_COVER:
+                cover = None                 # still the previous album's cover
+            cover = art_fetcher.get(artist, album) or cover if title else cover
+            return (title, artist, album, cover, device_label(ua)) if active else None
+
+        overlay = state.get("overlay")[0]
+        key = view_key()
+        if key != shown_key:
+            time.sleep(0.3)                  # let the rest of a metadata burst arrive
+            key = view_key()
+            base = None if key is None else compose(size, *key, fonts)
+            shown_key, dirty = key, True
+        if dirty:                            # new content: redraw the whole screen once
+            fb.clear() if base is None else fb.show(base)
+            dirty, panel_box = False, None
+            release_memory()
+        if overlay and (panel_box is None or now - overlay_at >= OVERLAY_REFRESH):
+            patch, panel_box = overlay_patch(base, debug_lines(state, inactive_for, running),
+                                             fonts[2], panel_box)
+            fb.show(patch, at=panel_box[:2])
+            overlay_at = now
+        elif not overlay and panel_box:      # overlay closed: restore that corner
+            fb.show(region(base, panel_box), at=panel_box[:2])
+            panel_box = None
+
+
+if __name__ == "__main__":
+    main()

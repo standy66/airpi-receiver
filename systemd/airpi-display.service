@@ -1,0 +1,20 @@
+[Unit]
+Description=AirPi now-playing screen (cover art over HDMI)
+After=shairport-sync.service airpi-cec.service
+Wants=shairport-sync.service airpi-cec.service
+
+[Service]
+User=pi
+SupplementaryGroups=video
+# Detach the text console from the screen so nothing draws over the cover
+ExecStartPre=+/bin/sh -c "echo 0 > /sys/class/vtconsole/vtcon1/bind"
+ExecStart=/usr/bin/python3 /usr/local/bin/airpi-display
+Restart=always
+RestartSec=3
+TimeoutStopSec=5
+# Lower priority than audio
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Register AirPi on HDMI-CEC as a playback device
+Before=airpi-display.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/cec-ctl -d /dev/cec0 --playback --osd-name AirPi
+
+[Install]
+WantedBy=multi-user.target
