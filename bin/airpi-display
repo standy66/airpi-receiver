@@ -48,6 +48,17 @@ FONT_REGULAR = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 FONT_MONO = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 ART_STOREFRONTS = ("gb", "us")  # iTunes storefronts to search, in order
 ART_CACHE_SIZE = 30             # albums kept in memory
+# What to search the iTunes catalogue for, tried in order until a result passes the
+# (same, strict) album/artist match. Rules only widen the search, never the match.
+ART_SEARCH_RULES = (
+    # Spotify lists every artist ("Massive Attack, Elizabeth Fraser"); Apple files the
+    # album under the main one.
+    ("first artist", lambda artist, album: f"{artist.split(',')[0]} {album}"),
+    ("full artist", lambda artist, album: f"{artist} {album}"),
+    # Albums the search engine misses with the artist in the query, and compilations,
+    # which Apple files under "Various Artists" while the sender gives the track artist.
+    ("album only", lambda artist, album: album),
+)
 BRACKETED = re.compile(r"\s*[\(\[][^)\]]*[\)\]]")  # "(Deluxe Edition)", "[Remastered]"
 STALE_COVER = 2.0               # seconds: a cover older than its track's text belongs to the previous track
 
@@ -136,7 +147,7 @@ def handle_item(state, m):
 
 def normalize(text):
     """Lower-case, drop "(Deluxe Edition)"-style suffixes and punctuation for comparing names."""
-    text = BRACKETED.sub("", text.lower())
+    text = BRACKETED.sub("", text.lower()).replace("&", " and ")
     text = re.sub(r"\s+-\s+(single|ep)$", "", text)
     return " ".join(re.sub(r"[^\w]+", " ", text).split())
 
@@ -164,36 +175,52 @@ class ArtFetcher:
 
     def _fetch(self, key, artist, album):
         try:
-            art = self._lookup(key, artist, album)
+            rule, art = self._lookup(key, artist, album)
         except (OSError, ValueError) as err:  # network trouble: allow a retry on the next track
             print("art: lookup failed:", err, flush=True)
             with self.lock:
                 self.cache.pop(key, None)
             return
-        print("art:", "found" if art else "no match", "for", artist, "-", album, flush=True)
+        print("art:", f"found via {rule}" if art else "no match", "for", artist, "-", album, flush=True)
         if art:
             with self.lock:
                 self.cache[key] = art
             self.state.changed.set()
 
     def _lookup(self, key, artist, album):
-        # Search with the first artist only: Spotify lists every artist on the track
-        # ("Massive Attack, Elizabeth Fraser"), Apple files the album under the main one.
-        term = f"{artist.split(',')[0]} {BRACKETED.sub('', album)}"
-        for country in ART_STOREFRONTS:
-            query = urllib.parse.urlencode({"term": term, "entity": "album", "limit": 25,
-                                            "country": country})
-            with urllib.request.urlopen(f"https://itunes.apple.com/search?{query}", timeout=8) as r:
-                results = json.load(r).get("results", [])
-            for item in results:
-                name, by = normalize(item.get("collectionName", "")), normalize(item.get("artistName", ""))
-                if name == key[1] and (key[0] in by or by in key[0]) and item.get("artworkUrl100"):
-                    url = item["artworkUrl100"].replace("100x100bb", f"{self.size}x{self.size}bb")
-                    with urllib.request.urlopen(url, timeout=8) as r:
-                        data = r.read()
-                    Image.open(io.BytesIO(data)).verify()  # make sure it is a real image
-                    return data
-        return None
+        """Returns (rule name, image bytes), or (None, None) if no rule finds a match."""
+        album_term, tried = BRACKETED.sub("", album), set()
+        for rule, make_term in ART_SEARCH_RULES:
+            term = make_term(artist, album_term)
+            if term in tried:                # e.g. a single artist: first == full
+                continue
+            tried.add(term)
+            for country in ART_STOREFRONTS:
+                for item in self._search(term, country):
+                    if self._matches(item, key):
+                        return rule, self._download(item["artworkUrl100"])
+        return None, None
+
+    @staticmethod
+    def _search(term, country):
+        query = urllib.parse.urlencode({"term": term, "entity": "album", "limit": 25,
+                                        "country": country})
+        with urllib.request.urlopen(f"https://itunes.apple.com/search?{query}", timeout=8) as r:
+            return json.load(r).get("results", [])
+
+    @staticmethod
+    def _matches(item, key):
+        """Album name must match exactly; the artist must match or be "Various Artists"."""
+        name, by = normalize(item.get("collectionName", "")), normalize(item.get("artistName", ""))
+        artist_ok = bool(by) and (key[0] in by or by in key[0] or by == "various artists")
+        return name == key[1] and artist_ok and bool(item.get("artworkUrl100"))
+
+    def _download(self, url100):
+        url = url100.replace("100x100bb", f"{self.size}x{self.size}bb")
+        with urllib.request.urlopen(url, timeout=8) as r:
+            data = r.read()
+        Image.open(io.BytesIO(data)).verify()        # make sure it is a real image
+        return data
 
 
 # --- HDMI-CEC ----------------------------------------------------------------
